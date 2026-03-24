@@ -11,3 +11,7 @@ CLAUDE.md
 *.out
 
 *.json
+.codeseek/
+packaging/pkg/
+packaging/*.pkg.tar.zst
+packaging/*.pkg.tar.xz
