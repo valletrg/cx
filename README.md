@@ -10,7 +10,7 @@
 
 ## Why cx exists
 
-AI coding agents like Claude Code default to grep or ripgrep when searching codebases. That works on small projects, but on anything large it scans every file on every query — wasting seconds per search and burning context tokens on irrelevant results.
+AI coding agents like Claude Code default to grep or ripgrep when searching codebases. That works on small projects, but on anything large it scans every file on every query, wasting seconds per search and burning context tokens on irrelevant results.
 
 cx maintains a persistent trigram index that narrows candidates before scanning. Instead of reading every file, cx intersects precomputed posting lists and scans only the handful of files that could possibly match. On a 180,000-file codebase like LLVM, that means results in 20ms instead of 445ms.
 
@@ -106,7 +106,7 @@ gets back a ranked list of candidate files, then drills into only those:
 cx "MyFunction" --json -t .cpp .h --limit 5
 ```
 
-The cx agent is read-only and only has access to the `Bash` tool — it cannot modify any files.
+The cx agent is read-only and only has access to the `Bash` tool, it cannot modify any files.
 
 ---
 
