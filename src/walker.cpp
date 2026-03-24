@@ -19,11 +19,20 @@ static bool is_gitignored(const fs::path& path,
         if (pat.empty() || pat.front() == '#') continue;
 
         if (pat.back() == '/') {
-            // Directory pattern — "build/" matches any component named "build"
             const std::string dir_name = pat.substr(0, pat.size() - 1);
-            for (const auto& comp : rel)
-                if (fnmatch(dir_name.c_str(), comp.string().c_str(), 0) == 0)
+            if (dir_name.find('/') != std::string::npos) {
+                // Path-relative directory pattern e.g. "packaging/pkg/" —
+                // match rel_str against the pattern path or any prefix of it.
+                if (rel_str == dir_name || rel_str.starts_with(dir_name + "/"))
                     return true;
+                if (fnmatch(dir_name.c_str(), rel_str.c_str(), FNM_PATHNAME) == 0)
+                    return true;
+            } else {
+                // Simple name pattern e.g. "build/" — matches any component
+                for (const auto& comp : rel)
+                    if (fnmatch(dir_name.c_str(), comp.string().c_str(), 0) == 0)
+                        return true;
+            }
         } else if (pat.find('/') != std::string::npos) {
             // Slash in pattern → match against relative path
             if (fnmatch(pat.c_str(), rel_str.c_str(), FNM_PATHNAME) == 0)

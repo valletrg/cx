@@ -1,4 +1,5 @@
 #include "index.h"
+#include "threadpool.h"
 
 #include <fcntl.h>
 #include <sys/inotify.h>
@@ -7,6 +8,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -24,7 +26,8 @@
 //   lookup   — sorted array of LookupEntry (trigram_hash → offset in postings)
 // ---------------------------------------------------------------------------
 
-static constexpr const char* kIndexDir     = ".cx";
+static constexpr const char* kIndexDir        = ".cx";
+static constexpr size_t      kBinaryProbeSize = 8192;
 static constexpr const char* kFilesName    = "files";
 static constexpr const char* kPostingsName = "postings";
 static constexpr const char* kLookupName   = "lookup";
@@ -133,25 +136,91 @@ bool build_index(const fs::path& root, const WalkOptions& opts) {
         return false;
     }
 
-    auto files = collect_files(root, opts);
+    // Augment gitignore patterns with hardcoded skips for .git/ and .cx/
+    auto patterns = opts.gitignore_patterns;
+    for (const std::string& always_skip : {std::string(".git/"), std::string(kIndexDir) + "/"}) {
+        if (std::find(patterns.begin(), patterns.end(), always_skip) == patterns.end())
+            patterns.push_back(always_skip);
+    }
+    WalkOptions walk_opts{.extensions = opts.extensions, .gitignore_patterns = patterns};
+    auto files = collect_files(root, walk_opts);
 
-    // Filter out files that live inside our own .cx directory
-    const std::string prefix = (root / kIndexDir).string();
-    files.erase(std::remove_if(files.begin(), files.end(), [&](const fs::path& p) {
-        return p.string().starts_with(prefix);
-    }), files.end());
+    const unsigned hw = std::thread::hardware_concurrency();
+    const size_t n_threads = hw > 0 ? static_cast<size_t>(hw) : 1;
+
+    // Phase 1: parallel trigram extraction.
+    // Each worker mmaps its file, extracts trigrams into a thread-local buffer,
+    // then locks once to append the batch to the shared lists.
+    std::atomic<uint32_t>                           id_counter{0};
+    std::vector<std::pair<uint32_t, uint32_t>>      all_pairs;    // {trigram, file_id}
+    std::vector<std::pair<uint32_t, std::string>>   file_entries; // {file_id, path}
+    std::mutex                                       merge_mtx;
+
+    {
+        ThreadPool pool(n_threads,
+            [&](const fs::path& f, const fs::path*) {
+                uint32_t fid = id_counter.fetch_add(1, std::memory_order_relaxed);
+
+                thread_local std::vector<std::pair<uint32_t, uint32_t>> local;
+                local.clear();
+
+                int fd = open(f.c_str(), O_RDONLY);
+                if (fd >= 0) {
+                    struct stat st{};
+                    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+                        void* addr = mmap(nullptr,
+                                         static_cast<size_t>(st.st_size),
+                                         PROT_READ, MAP_PRIVATE, fd, 0);
+                        if (addr != MAP_FAILED) {
+                            // Skip binary files (same heuristic as searcher)
+                            const size_t probe = std::min(static_cast<size_t>(st.st_size),
+                                                          kBinaryProbeSize);
+                            const char* data = static_cast<const char*>(addr);
+                            bool is_binary = std::memchr(data, '\0', probe) != nullptr;
+                            if (!is_binary) {
+                                std::string_view sv(data, static_cast<size_t>(st.st_size));
+                                auto trigrams = extract_trigrams(sv);
+                                local.reserve(trigrams.size());
+                                for (uint32_t t : trigrams)
+                                    local.emplace_back(t, fid);
+                            }
+                            munmap(addr, static_cast<size_t>(st.st_size));
+                        }
+                    }
+                    close(fd);
+                }
+
+                // One lock acquisition per file — never per trigram
+                std::lock_guard<std::mutex> lk(merge_mtx);
+                all_pairs.insert(all_pairs.end(), local.begin(), local.end());
+                file_entries.emplace_back(fid, f.string());
+            });
+
+        for (const auto& f : files)
+            pool.enqueue(f);
+        pool.wait();
+    }
+
+    // Phase 2: single-threaded merge and write.
+    // Sort file entries by id so g_index.files[id] == path holds.
+    std::sort(file_entries.begin(), file_entries.end());
+
+    // Sort pairs by (trigram, file_id) so posting lists come out sorted.
+    std::sort(all_pairs.begin(), all_pairs.end());
+
+    std::unordered_map<uint32_t, std::vector<uint32_t>> tmap;
+    for (const auto& [t, fid] : all_pairs) {
+        auto& ids = tmap[t];
+        if (ids.empty() || ids.back() != fid)
+            ids.push_back(fid);
+    }
 
     std::lock_guard<std::mutex> lock(g_index.mtx);
     g_index.files.clear();
-    g_index.trigram_to_files.clear();
-
-    for (uint32_t id = 0; id < static_cast<uint32_t>(files.size()); ++id) {
-        g_index.files.push_back(files[id].string());
-        auto content  = read_file_content(files[id]);
-        auto trigrams = extract_trigrams(content);
-        for (uint32_t t : trigrams)
-            g_index.trigram_to_files[t].push_back(id); // ids stay sorted (inserted ascending)
-    }
+    g_index.files.reserve(file_entries.size());
+    for (const auto& [fid, path] : file_entries)
+        g_index.files.push_back(path);
+    g_index.trigram_to_files = std::move(tmap);
 
     write_index(index_dir);
     return true;
@@ -201,14 +270,14 @@ std::vector<fs::path> query_index(const fs::path& root,
     int lfd = open(lookup_path.c_str(), O_RDONLY);
     if (lfd < 0) return {};
     struct stat lst{};
-    fstat(lfd, &lst);
-    if (lst.st_size == 0) { close(lfd); return {}; }
-    const auto* lookup = static_cast<const LookupEntry*>(
-        mmap(nullptr, static_cast<size_t>(lst.st_size), PROT_READ, MAP_PRIVATE, lfd, 0));
+    if (fstat(lfd, &lst) < 0 || lst.st_size == 0) { close(lfd); return {}; }
+    const size_t lookup_size = static_cast<size_t>(lst.st_size);
+    void* lookup_raw = mmap(nullptr, lookup_size, PROT_READ, MAP_PRIVATE, lfd, 0);
     close(lfd);
-    if (lookup == MAP_FAILED) return {};
+    if (lookup_raw == MAP_FAILED) return {};
+    const auto* lookup = static_cast<const LookupEntry*>(lookup_raw);
 
-    const size_t n_entries = static_cast<size_t>(lst.st_size) / sizeof(LookupEntry);
+    const size_t n_entries = lookup_size / sizeof(LookupEntry);
 
     std::ifstream postings_f(postings_path, std::ios::binary);
 
@@ -232,7 +301,7 @@ std::vector<fs::path> query_index(const fs::path& root,
 
         if (!found) {
             // No file contains this trigram → intersection is empty
-            munmap(const_cast<LookupEntry*>(lookup), static_cast<size_t>(lst.st_size));
+            munmap(lookup_raw, lookup_size);
             return {};
         }
 
@@ -258,7 +327,7 @@ std::vector<fs::path> query_index(const fs::path& root,
         if (candidates->empty()) break;
     }
 
-    munmap(const_cast<LookupEntry*>(lookup), static_cast<size_t>(lst.st_size));
+    munmap(lookup_raw, lookup_size);
 
     if (!candidates.has_value()) return {};
 

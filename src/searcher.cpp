@@ -26,7 +26,8 @@
 
 #include <re2/re2.h>
 
-static constexpr size_t MMAP_THRESHOLD = 65536;
+static constexpr size_t MMAP_THRESHOLD    = 65536;
+static constexpr size_t BINARY_PROBE_SIZE = 8192;
 
 static void scan_lines(const char* data, size_t file_size,
                        const std::string& pattern,
@@ -120,26 +121,26 @@ bool search_file(const fs::path& path,
         if (n < 0) return false;
         const size_t actual = static_cast<size_t>(n);
 
-        const size_t check_size = std::min(actual, size_t{8192});
+        const size_t check_size = std::min(actual, BINARY_PROBE_SIZE);
         if (memchr(buf.data(), '\0', check_size) != nullptr) return false;
 
         scan_lines(buf.data(), actual, pattern, opts, re.get(),
                    lower_pattern, result);
     } else {
-        const char* data = static_cast<const char*>(
-            mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
+        void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
-        if (data == MAP_FAILED) return false;
+        if (mapped == MAP_FAILED) return false;
+        const char* data = static_cast<const char*>(mapped);
 
-        const size_t check_size = std::min(file_size, size_t{8192});
+        const size_t check_size = std::min(file_size, BINARY_PROBE_SIZE);
         if (memchr(data, '\0', check_size) != nullptr) {
-            munmap(const_cast<char*>(data), file_size);
+            munmap(mapped, file_size);
             return false;
         }
 
         scan_lines(data, file_size, pattern, opts, re.get(),
                    lower_pattern, result);
-        munmap(const_cast<char*>(data), file_size);
+        munmap(mapped, file_size);
     }
 
     return true;
