@@ -1,0 +1,13 @@
+build/
+.cx/
+PLANS.md
+CLAUDE.md
+*_PROMPT.md
+.cache/
+
+*.o
+*.a
+*.so
+*.out
+
+*.json

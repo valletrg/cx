@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# cx-init — initialize a cx search index for the current project
+# Install: sudo cp cx-init /usr/local/bin/cx-init && sudo chmod +x /usr/local/bin/cx-init
+
+set -euo pipefail
+
+TARGET="${1:-.}"
+TARGET="$(realpath "$TARGET")"
+
+echo "cx-init: indexing $TARGET"
+echo ""
+
+# check cx is available
+if ! command -v cx &>/dev/null; then
+    echo "error: cx is not installed or not in PATH"
+    echo "build it first: cmake --build build && sudo ln -sf \$(pwd)/build/cx /usr/local/bin/cx"
+    exit 1
+fi
+
+# check target exists
+if [[ ! -d "$TARGET" ]]; then
+    echo "error: directory not found: $TARGET"
+    exit 1
+fi
+
+# check if already indexed
+if [[ -d "$TARGET/.cx" ]]; then
+    echo "existing index found at $TARGET/.cx/"
+    read -rp "rebuild it? [y/N] " confirm
+    if [[ "${confirm,,}" != "y" ]]; then
+        echo "keeping existing index."
+        echo ""
+        echo "ready. run: cx \"<pattern>\" --json"
+        exit 0
+    fi
+    echo ""
+fi
+
+# count files for context
+FILE_COUNT=$(find "$TARGET" -type f ! -path '*/.git/*' ! -path '*/.cx/*' | wc -l)
+echo "found $FILE_COUNT files to index"
+echo ""
+
+# run the index
+START=$(date +%s%N)
+cx "." -p "$TARGET" --reindex > /dev/null 2>&1
+END=$(date +%s%N)
+
+ELAPSED=$(( (END - START) / 1000000 ))
+
+echo "index built in ${ELAPSED}ms"
+echo ""
+echo "index location: $TARGET/.cx/"
+ls -lh "$TARGET/.cx/"
+echo ""
+echo "ready. example searches:"
+echo "  cx \"pattern\" --json"
+echo "  cx \"pattern\" --files-only --json"
+echo "  cx \"fn_name\" --regex --json -t .cpp .h"

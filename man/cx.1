@@ -1,0 +1,180 @@
+.TH CX 1 "March 2026" "cx 0.1.0" "User Commands"
+.SH NAME
+cx \- fast code search tool for Claude subagent context retrieval
+.SH SYNOPSIS
+.B cx
+[\fIOPTIONS\fR]
+.I pattern
+.SH DESCRIPTION
+.B cx
+is a fast, mmap-based code search tool that recursively searches a directory
+tree for files containing a given literal string or regular expression pattern.
+Results are sorted by match density (match count divided by total line count),
+with the most relevant files listed first.
+.PP
+.B cx
+is designed to be called as a tool by a Claude AI subagent.
+Using
+.B cx
+instead of broad file reads allows an agent to locate relevant code without
+consuming large numbers of context tokens on files that do not contain the
+symbol or pattern being searched for.
+The
+.B \-\-json
+output mode produces machine-readable output intended for programmatic
+consumption by the agent.
+.PP
+On the first search in a directory tree, pass
+.B \-\-reindex
+to build a trigram index under
+.IR .cx/ .
+Subsequent searches will use the index to narrow the set of candidate files
+before scanning, significantly reducing search time on large codebases.
+.SH OPTIONS
+.TP
+.I pattern
+The search pattern (required). Treated as a literal string by default.
+Pass
+.B \-r
+to enable RE2 regular expression mode.
+.TP
+.BR \-p ", " \-\-path " " \fIdir\fR
+Directory to search. Defaults to the current working directory.
+.TP
+.BR \-t ", " \-\-type " " \fIext\fR " [" \fIext\fR "...]"
+Restrict search to files with the given extension(s).
+Multiple extensions may be supplied: \fB\-t .cpp .h\fR.
+.TP
+.BR \-i ", " \-\-ignore\-case
+Perform a case-insensitive search. Has no effect in regex mode (use
+inline RE2 flags such as
+.B (?i)
+instead).
+.TP
+.BR \-r ", " \-\-regex
+Treat
+.I pattern
+as an RE2 regular expression rather than a literal string.
+Regex mode bypasses the trigram index and scans all candidate files.
+.TP
+.B \-\-json
+Output results as a JSON array.
+Each element contains
+.BR file ,
+.BR match_count ,
+.BR density ,
+and a
+.B matches
+array of
+.RB { line ", " content }
+objects.
+When there are no matches the output is
+.BR [] .
+.TP
+.B \-\-files\-only
+Print only file paths and match counts, omitting per-line match content.
+When combined with
+.B \-\-json
+the
+.B matches
+array is omitted from each result object.
+.TP
+.BI \-\-limit " N"
+Return at most
+.I N
+results, ordered by density descending.
+Useful for controlling token usage when cx is called by an agent.
+.TP
+.BI \-\-threads " N"
+Use
+.I N
+worker threads for parallel file scanning.
+Defaults to
+.BR std::thread::hardware_concurrency() .
+Minimum: 1.
+.TP
+.B \-\-reindex
+Build or rebuild the trigram index under
+.I .cx/
+in the search directory, then run the search.
+After the index is built a background inotify watcher is started that
+incrementally updates the index as files are created or modified.
+.SH FILES
+.TP
+.I .cx/files
+Newline-separated list of indexed file paths.
+Line N (0-based) is the path for file ID N.
+.TP
+.I .cx/postings
+Binary posting lists: for each trigram, a length-prefixed array of uint32_t
+file IDs sorted in ascending order.
+.TP
+.I .cx/lookup
+Binary sorted array of {uint32_t trigram_hash, uint64_t postings_offset}
+pairs.
+Memory-mapped at query time; binary-searched to locate posting lists.
+.TP
+.I .gitignore
+If present in the search root,
+.B cx
+reads this file and skips matching files and directories.
+Supported patterns: exact paths, \fB*.ext\fR globs, and directory names
+ending in
+.BR / .
+.SH EXAMPLES
+.TP
+Search for all occurrences of \fBstd::vector\fR in C++ sources:
+.B cx
+.B std::vector
+.B \-t .cpp .h
+.TP
+Build the index for the current tree and search with JSON output:
+.B cx
+.B malloc
+.B \-\-reindex
+.B \-\-json
+.TP
+Find which files define a struct, limited to 5 results for an agent call:
+.B cx
+.B "struct MyStruct"
+.B \-\-json
+.B \-\-files\-only
+.B \-\-limit 5
+.TP
+Regex search for function definitions, ignoring the build directory:
+.B cx
+.B "^[a-z].*\\\\(.*\\\\) \\\\{"
+.B \-\-regex
+.B \-t .cpp
+.B \-\-json
+.TP
+Search the Linux kernel source (4-thread, JSON, no index):
+.B cx
+.B "copy_from_user"
+.B \-p /usr/src/linux
+.B \-\-threads 4
+.B \-\-json
+.B \-\-limit 20
+.SH EXIT STATUS
+.B cx
+exits 0 on success and non-zero on fatal error (e.g. index build failure).
+Finding no matches is not an error and exits 0.
+.SH NOTES
+.B cx
+is intentionally designed to be invoked as a bash tool by a Claude AI subagent.
+The recommended workflow is:
+.IP 1. 3
+Call
+.B cx \-\-files\-only \-\-json
+to locate candidate files.
+.IP 2. 3
+Call
+.B cx \-\-json \-\-limit N
+on the most relevant files to retrieve match context.
+.IP 3. 3
+Use the returned file paths and line numbers to read only the relevant
+sections with a file-read tool.
+.PP
+This avoids reading entire files into the agent's context window.
+.SH AUTHORS
+cx contributors
