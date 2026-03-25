@@ -31,6 +31,13 @@ cx ships as a Claude Code skill — install it once and Claude Code automaticall
 yay -S cx-search
 ```
 
+**Skill Installation**
+
+```bash
+mkdir -p ~/.claude/skills/cx
+cp cx-skill/SKILL.md ~/.claude/skills/cx/SKILL.md
+```
+
 **Manual build:**
 
 ```bash
