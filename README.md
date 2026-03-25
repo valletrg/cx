@@ -14,7 +14,7 @@ AI coding agents like Claude Code default to grep or ripgrep when searching code
 
 cx maintains a persistent trigram index that narrows candidates before scanning. Instead of reading every file, cx intersects precomputed posting lists and scans only the handful of files that could possibly match. On a 180,000-file codebase like LLVM, that means results in 20ms instead of 445ms.
 
-cx ships as a Claude Code skill — install it once and Claude Code automatically knows how to use it for any code search task.
+cx ships as a Claude Code skill, install it once and Claude Code automatically knows how to use it for any code search task.
 
 | Codebase | Files | cx (indexed) | ripgrep |
 |---|---|---|---|
