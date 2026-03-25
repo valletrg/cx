@@ -1,6 +1,6 @@
 # cx
 
-**A fast trigram-indexed code search engine built for use as a Claude subagent**
+**A fast trigram-indexed code search engine designed as a Claude Code skill**
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Platform: Linux](https://img.shields.io/badge/Platform-Linux-lightgrey.svg)
@@ -13,6 +13,8 @@
 AI coding agents like Claude Code default to grep or ripgrep when searching codebases. That works on small projects, but on anything large it scans every file on every query, wasting seconds per search and burning context tokens on irrelevant results.
 
 cx maintains a persistent trigram index that narrows candidates before scanning. Instead of reading every file, cx intersects precomputed posting lists and scans only the handful of files that could possibly match. On a 180,000-file codebase like LLVM, that means results in 20ms instead of 445ms.
+
+cx ships as a Claude Code skill — install it once and Claude Code automatically knows how to use it for any code search task.
 
 | Codebase | Files | cx (indexed) | ripgrep |
 |---|---|---|---|
@@ -78,23 +80,26 @@ cx "MyClass" --regex --json -t .cpp .h
 
 ---
 
-## Claude Code subagent setup
+## Claude Code skill setup
 
 This is the primary use case cx was built for.
 
-1. Copy `cx.md` to `~/.claude/agents/cx.md`:
+1. Copy the skill into your Claude skills directory:
 
    ```bash
-   cp /usr/share/doc/cx-search/cx.md ~/.claude/agents/cx.md
-   # or from source:
-   cp cx.md ~/.claude/agents/cx.md
+   mkdir -p ~/.claude/skills/cx
+   cp cx-skill/SKILL.md ~/.claude/skills/cx/SKILL.md
    ```
 
-2. Claude Code will automatically delegate code search tasks to the cx agent.
+2. Claude Code will automatically use cx when searching your codebase. No configuration needed.
 
-3. The agent auto-initializes the index at the start of each session using `cx-init`.
+3. Initialize the index in any project before searching:
 
-**What it looks like in practice:** when Claude Code needs to find a function or symbol, instead of grepping every file, it dispatches the cx subagent, which runs:
+   ```bash
+   cx-init
+   ```
+
+**What it looks like in practice:** when Claude Code needs to find a function or symbol, instead of grepping every file, it uses cx, which runs:
 
 ```bash
 cx "MyFunction" --files-only --json
@@ -106,7 +111,7 @@ gets back a ranked list of candidate files, then drills into only those:
 cx "MyFunction" --json -t .cpp .h --limit 5
 ```
 
-The cx agent is read-only and only has access to the `Bash` tool, it cannot modify any files.
+The cx skill is read-only and only has access to the `Bash` tool, it cannot modify any files.
 
 ---
 

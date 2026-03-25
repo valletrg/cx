@@ -65,6 +65,7 @@
 #include <unistd.h>
 
 #include <CLI/CLI.hpp>
+#include <re2/re2.h>
 
 #include "walker.h"
 #include "searcher.h"
@@ -223,6 +224,19 @@ int main(int argc, char* argv[]) {
     CLI11_PARSE(app, argc, argv);
 
     if (n_threads < 1) n_threads = 1;
+
+    // Validate regex early so we never crash inside worker threads.
+    if (use_regex) {
+        re2::RE2::Options re_opts;
+        re_opts.set_case_sensitive(!case_insensitive);
+        re_opts.set_log_errors(false); // suppress RE2's own stderr noise
+        re2::RE2 probe(pattern, re_opts);
+        if (!probe.ok()) {
+            std::cerr << "[cx] invalid regex: " << probe.error() << "\n";
+            if (json_output) std::print("[]\n");
+            return 0;
+        }
+    }
 
     const fs::path root(search_path);
 

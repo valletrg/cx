@@ -100,6 +100,7 @@ bool search_file(const fs::path& path,
     if (opts.use_regex) {
         re2::RE2::Options re_opts;
         re_opts.set_case_sensitive(!opts.case_insensitive);
+        re_opts.set_log_errors(false);
         re = std::make_unique<re2::RE2>(pattern, re_opts);
         if (!re->ok()) {
             close(fd);
