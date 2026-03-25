@@ -1,7 +1,6 @@
-
 ---
 name: cx
-description: Search a codebase for files or lines matching a pattern, symbol, function name, type, string, or regex. Use when you need to find where something is defined, used, or referenced. Use before reading any file to avoid wasting context. Examples - finding a function definition, locating usages of a variable, finding which files import a module.
+description: Use this skill for ANY code search task — finding functions, symbols, classes, usages, definitions, or any pattern in source files. Use instead of the built-in Search tool. Triggers on: "find", "where is", "search for", "locate", "which file", "show me where".
 ---
 
 # cx — Code Search
@@ -35,9 +34,10 @@ Step 1 — find relevant files (cheap, no line content):
 cx "pattern" --files-only --json -t .cpp .h
 ```
 
-Step 2 — get line numbers from the most relevant file only:
+Step 2 — get line numbers from the most relevant directory only:
 ```bash
-cx "pattern" --json -p src/specific_file_dir --limit 3
+# -p must always be a DIRECTORY path, never a file path
+cx "pattern" --json -p src/ --limit 3
 ```
 
 **Never run a broad `--json` search across the whole project in one call.**
@@ -51,10 +51,11 @@ cx "pattern" --json -p src/specific_file_dir --limit 3
 - Always use `--limit 5` unless more results are explicitly needed
 - Never fall back to grep, sed, head, or cat — cx only
 - Never reindex mid-task unless files were just written
+- `-p` must always be a directory path — never pass a file path to `-p`
 
 ## Output format
 
-Return ONLY file paths and line numbers. No explanations. No summaries.
+Return ONLY file paths and line numbers. No explanations. No summaries. No sentences.
 
 Correct:
 ```
@@ -74,7 +75,7 @@ If nothing found: `NOT FOUND`
 | `--limit N` | Cap results to N files |
 | `-t .ext` | Filter by file extension |
 | `--regex` / `-r` | RE2 regex mode |
-| `-p <path>` | Scope to directory |
+| `-p <dir>` | Scope to directory (must be a directory, not a file) |
 | `--reindex` | Build or rebuild the index |
 | `--no-index` | Skip index, scan all files |
 
@@ -95,4 +96,7 @@ cx "void.*functionName" --regex --files-only --json -t .cpp
 
 # find imports
 cx "import module_name" --files-only --json -t .py
+
+# drill into a directory (always a directory, never a file)
+cx "pattern" --json -p src/ --limit 3
 ```
