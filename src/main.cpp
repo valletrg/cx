@@ -62,6 +62,7 @@
 #include <thread>
 
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <CLI/CLI.hpp>
@@ -126,14 +127,76 @@ static std::string json_escape(const std::string& s) {
 // Output
 // ---------------------------------------------------------------------------
 
-static void print_human(const std::vector<FileResult>& results, bool files_only) {
+static void print_human(const std::vector<FileResult>& results, bool files_only,
+                        const fs::path& root) {
+    const bool is_tty = isatty(STDOUT_FILENO) != 0;
+
+    int term_width = 120;
+    if (is_tty) {
+        struct winsize w{};
+        ioctl(STDOUT_FILENO, TIOCGWINSZ, &w);
+        if (w.ws_col > 0) term_width = static_cast<int>(w.ws_col);
+    }
+
+    const char* COL_FILENAME = is_tty ? "\033[1;36m" : "";
+    const char* COL_LINENUM  = is_tty ? "\033[0;33m" : "";
+    const char* COL_MATCH    = is_tty ? "\033[1;31m" : "";
+    const char* COL_DIM      = is_tty ? "\033[2m"    : "";
+    const char* COL_RESET    = is_tty ? "\033[0m"    : "";
+
+    bool first_file = true;
     for (const auto& r : results) {
         if (r.matches.empty()) continue;
+
+        std::error_code ec;
+        fs::path rel = fs::relative(r.file, root, ec);
+        if (ec) rel = r.file;
+        const std::string rel_str = rel.string();
+
         if (files_only) {
-            std::println("{}: {} matches", r.file.string(), r.matches.size());
+            const char* word = r.matches.size() == 1 ? "match" : "matches";
+            std::print("{}{}{}", COL_FILENAME, rel_str, COL_RESET);
+            std::println("  {}{} {}{}", COL_DIM, r.matches.size(), word, COL_RESET);
         } else {
-            for (const auto& m : r.matches)
-                std::println("{}:{}:{}", r.file.string(), m.line, m.content);
+            if (!first_file) std::println("");
+            first_file = false;
+
+            std::println("{}{}{}", COL_FILENAME, rel_str, COL_RESET);
+
+            for (const auto& m : r.matches) {
+                // Content — truncate if needed (TTY only)
+                std::string content = m.content;
+                int mstart = m.match_start;
+                int mlen   = m.match_len;
+
+                if (is_tty) {
+                    const int max_content = std::max(1, term_width - 8);
+                    if (static_cast<int>(content.size()) > max_content) {
+                        content = content.substr(0, static_cast<size_t>(max_content));
+                        content += "\xe2\x80\xa6"; // UTF-8 '…'
+                        if (mstart >= max_content) {
+                            mstart = -1;
+                        } else if (mstart + mlen > max_content) {
+                            mlen = max_content - mstart;
+                        }
+                    }
+                }
+
+                // Emit: "  <linenum>  <content with highlight>"
+                if (is_tty && mstart >= 0 && mlen > 0 &&
+                    mstart + mlen <= static_cast<int>(content.size())) {
+                    const std::string before = content.substr(0, static_cast<size_t>(mstart));
+                    const std::string match  = content.substr(static_cast<size_t>(mstart),
+                                                              static_cast<size_t>(mlen));
+                    const std::string after  = content.substr(static_cast<size_t>(mstart + mlen));
+                    std::print("  {}{:4}{}  {}{}{}{}{}\n",
+                        COL_LINENUM, m.line, COL_RESET,
+                        before, COL_MATCH, match, COL_RESET, after);
+                } else {
+                    std::print("  {}{:4}{}  {}\n",
+                        COL_LINENUM, m.line, COL_RESET, content);
+                }
+            }
         }
     }
 }
@@ -338,7 +401,7 @@ int main(int argc, char* argv[]) {
     if (json_output)
         print_json(results, files_only);
     else
-        print_human(results, files_only);
+        print_human(results, files_only, root);
 
     return 0;
 }

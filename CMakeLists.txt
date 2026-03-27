@@ -24,6 +24,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(re2)
 
+# FastPFor — SIMD-accelerated integer compression for posting lists
+FetchContent_Declare(
+    FastPFor
+    GIT_REPOSITORY https://github.com/lemire/FastPFor.git
+    GIT_TAG        master
+)
+FetchContent_MakeAvailable(FastPFor)
+
 add_executable(cx
     src/main.cpp
     src/walker.cpp
@@ -40,7 +48,13 @@ if(_re2_inc)
     target_include_directories(cx SYSTEM PRIVATE ${_re2_inc})
 endif()
 
-target_link_libraries(cx PRIVATE CLI11::CLI11 re2::re2)
+target_link_libraries(cx PRIVATE CLI11::CLI11 re2::re2 FastPFOR)
+
+# Mark FastPFor headers as system includes to suppress warnings under -Wpedantic
+get_target_property(_fastpfor_inc FastPFOR INTERFACE_INCLUDE_DIRECTORIES)
+if(_fastpfor_inc)
+    target_include_directories(cx SYSTEM PRIVATE ${_fastpfor_inc})
+endif()
 target_compile_options(cx PRIVATE -Wall -Wextra -Wpedantic)
 
 # SIMD acceleration for literal search

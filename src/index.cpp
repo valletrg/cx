@@ -19,6 +19,14 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+#include <fastpfor.h>
+#include <compositecodec.h>
+#include <variablebyte.h>
+#pragma GCC diagnostic pop
+
 // ---------------------------------------------------------------------------
 // On-disk layout inside <root>/.cx/
 //
@@ -33,9 +41,19 @@ static constexpr const char* kFilesName    = "files";
 static constexpr const char* kPostingsName = "postings";
 static constexpr const char* kLookupName   = "lookup";
 
+// Index format version — increment when on-disk format changes.
+static constexpr uint32_t kIndexVersion = 2;
+
+// Posting lists smaller than this are stored uncompressed (FastPFor overhead).
+static constexpr size_t kMinCompressSize = 4;
+
 // Max (trigram, file_id) pairs to buffer per thread before flushing to disk.
 // 4M pairs × 8 bytes = 32MB per thread. With 8 threads = 256MB peak.
 static constexpr size_t kFlushThreshold = 4 * 1024 * 1024;
+
+// Lines longer than this are skipped during trigram extraction (avoids
+// bloating the index with minified JS, generated protobuf output, etc.).
+static constexpr size_t kMaxIndexLineLen = 512;
 
 #pragma pack(push, 1)
 struct LookupEntry {
@@ -64,11 +82,37 @@ static InMemoryIndex g_index; // NOLINT(cppcoreguidelines-avoid-non-const-global
 static std::unordered_set<uint32_t> extract_trigrams(std::string_view content) {
     std::unordered_set<uint32_t> out;
     if (content.size() < 3) return out;
-    for (size_t i = 0; i + 2 < content.size(); ++i) {
-        uint32_t t = (static_cast<uint32_t>(static_cast<uint8_t>(content[i]))     << 16) |
-                     (static_cast<uint32_t>(static_cast<uint8_t>(content[i + 1])) <<  8) |
-                      static_cast<uint32_t>(static_cast<uint8_t>(content[i + 2]));
-        out.insert(t);
+
+    // Process line-by-line, skipping long and non-alphanumeric lines.
+    const char* line_start = content.data();
+    const char* end = content.data() + content.size();
+    while (line_start < end) {
+        const char* line_end = static_cast<const char*>(
+            memchr(line_start, '\n', static_cast<size_t>(end - line_start)));
+        if (!line_end) line_end = end;
+        const size_t line_len = static_cast<size_t>(line_end - line_start);
+
+        if (line_len <= kMaxIndexLineLen && line_len >= 3) {
+            bool has_alnum = false;
+            for (size_t j = 0; j < line_len; ++j) {
+                uint8_t c = static_cast<uint8_t>(line_start[j]);
+                if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                    (c >= 'a' && c <= 'z')) {
+                    has_alnum = true;
+                    break;
+                }
+            }
+            if (has_alnum) {
+                for (size_t i = 0; i + 2 < line_len; ++i) {
+                    uint32_t t =
+                        (static_cast<uint32_t>(static_cast<uint8_t>(line_start[i]))     << 16) |
+                        (static_cast<uint32_t>(static_cast<uint8_t>(line_start[i + 1])) <<  8) |
+                         static_cast<uint32_t>(static_cast<uint8_t>(line_start[i + 2]));
+                    out.insert(t);
+                }
+            }
+        }
+        line_start = line_end + 1;
     }
     return out;
 }
@@ -114,17 +158,46 @@ static void write_index(const fs::path& index_dir) {
     std::ofstream pf(index_dir / kPostingsName, std::ios::binary | std::ios::trunc);
     std::ofstream lf(index_dir / kLookupName,   std::ios::binary | std::ios::trunc);
 
+    // Write version header.
+    lf.write(reinterpret_cast<const char*>(&kIndexVersion), sizeof(kIndexVersion));
+
+    FastPForLib::CompositeCodec<FastPForLib::FastPFor<8>,
+                                FastPForLib::VariableByte> codec;
+    std::vector<uint32_t> deltas;
+    std::vector<uint32_t> compressed;
+
     uint64_t offset = 0;
     for (const auto& [hash, ids] : sorted) {
         LookupEntry entry{hash, offset};
         lf.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
 
-        auto count = static_cast<uint32_t>(ids.size());
-        pf.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        pf.write(reinterpret_cast<const char*>(ids.data()),
-                 static_cast<std::streamsize>(ids.size() * sizeof(uint32_t)));
+        auto original_count = static_cast<uint32_t>(ids.size());
 
-        offset += sizeof(uint32_t) + ids.size() * sizeof(uint32_t);
+        if (original_count < kMinCompressSize) {
+            uint32_t compressed_size = 0;
+            pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
+            pf.write(reinterpret_cast<const char*>(&compressed_size), sizeof(compressed_size));
+            pf.write(reinterpret_cast<const char*>(ids.data()),
+                     static_cast<std::streamsize>(ids.size() * sizeof(uint32_t)));
+            offset += 2 * sizeof(uint32_t) + ids.size() * sizeof(uint32_t);
+        } else {
+            deltas.resize(ids.size());
+            deltas[0] = ids[0];
+            for (size_t i = 1; i < ids.size(); ++i)
+                deltas[i] = ids[i] - ids[i - 1];
+
+            compressed.resize(ids.size() + 1024);
+            size_t compressed_len = compressed.size();
+            codec.encodeArray(deltas.data(), deltas.size(),
+                              compressed.data(), compressed_len);
+
+            auto comp_size = static_cast<uint32_t>(compressed_len);
+            pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
+            pf.write(reinterpret_cast<const char*>(&comp_size), sizeof(comp_size));
+            pf.write(reinterpret_cast<const char*>(compressed.data()),
+                     static_cast<std::streamsize>(compressed_len * sizeof(uint32_t)));
+            offset += 2 * sizeof(uint32_t) + compressed_len * sizeof(uint32_t);
+        }
     }
 }
 
@@ -239,20 +312,54 @@ static void merge_runs(const std::vector<fs::path>& run_paths,
     std::ofstream pf(index_dir / kPostingsName, std::ios::binary | std::ios::trunc);
     std::ofstream lf(index_dir / kLookupName,   std::ios::binary | std::ios::trunc);
 
+    // Write version header as first bytes of lookup file.
+    lf.write(reinterpret_cast<const char*>(&kIndexVersion), sizeof(kIndexVersion));
+
+    FastPForLib::CompositeCodec<FastPForLib::FastPFor<8>,
+                                FastPForLib::VariableByte> codec;
+
     uint64_t offset = 0;
     uint32_t cur_trigram = 0;
     bool     have_cur    = false;
     std::vector<uint32_t> cur_ids;   // posting list being accumulated
+    std::vector<uint32_t> deltas;    // reusable delta buffer
+    std::vector<uint32_t> compressed; // reusable compression buffer
 
     auto flush_posting = [&]() {
         if (cur_ids.empty()) return;
         LookupEntry entry{cur_trigram, offset};
         lf.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
-        auto count = static_cast<uint32_t>(cur_ids.size());
-        pf.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        pf.write(reinterpret_cast<const char*>(cur_ids.data()),
-                 static_cast<std::streamsize>(cur_ids.size() * sizeof(uint32_t)));
-        offset += sizeof(uint32_t) + cur_ids.size() * sizeof(uint32_t);
+
+        auto original_count = static_cast<uint32_t>(cur_ids.size());
+
+        if (original_count < kMinCompressSize) {
+            // Store uncompressed: [original_count, 0 (compressed_size=0), raw ids...]
+            uint32_t compressed_size = 0;
+            pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
+            pf.write(reinterpret_cast<const char*>(&compressed_size), sizeof(compressed_size));
+            pf.write(reinterpret_cast<const char*>(cur_ids.data()),
+                     static_cast<std::streamsize>(cur_ids.size() * sizeof(uint32_t)));
+            offset += 2 * sizeof(uint32_t) + cur_ids.size() * sizeof(uint32_t);
+        } else {
+            // Delta encode
+            deltas.resize(cur_ids.size());
+            deltas[0] = cur_ids[0];
+            for (size_t i = 1; i < cur_ids.size(); ++i)
+                deltas[i] = cur_ids[i] - cur_ids[i - 1];
+
+            // Compress
+            compressed.resize(cur_ids.size() + 1024); // generous output buffer
+            size_t compressed_len = compressed.size();
+            codec.encodeArray(deltas.data(), deltas.size(),
+                              compressed.data(), compressed_len);
+
+            auto compressed_size = static_cast<uint32_t>(compressed_len);
+            pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
+            pf.write(reinterpret_cast<const char*>(&compressed_size), sizeof(compressed_size));
+            pf.write(reinterpret_cast<const char*>(compressed.data()),
+                     static_cast<std::streamsize>(compressed_len * sizeof(uint32_t)));
+            offset += 2 * sizeof(uint32_t) + compressed_len * sizeof(uint32_t);
+        }
         cur_ids.clear();
     };
 
@@ -366,16 +473,44 @@ bool build_index(const fs::path& root, const WalkOptions& opts) {
                     return;
                 }
 
-                // Extract unique trigrams, then append (trigram, fid) to buffer.
+                // Extract unique trigrams line-by-line, skipping long lines
+                // and lines with no alphanumeric characters.
                 if (fsize >= 3) {
                     std::unordered_set<uint32_t> seen;
-                    for (size_t i = 0; i + 2 < fsize; ++i) {
-                        uint32_t t =
-                            (static_cast<uint32_t>(static_cast<uint8_t>(data[i]))     << 16) |
-                            (static_cast<uint32_t>(static_cast<uint8_t>(data[i + 1])) <<  8) |
-                             static_cast<uint32_t>(static_cast<uint8_t>(data[i + 2]));
-                        if (seen.insert(t).second)
-                            buf.emplace_back(t, fid);
+                    const char* line_start = data;
+                    const char* file_end = data + fsize;
+                    while (line_start < file_end) {
+                        const char* line_end = static_cast<const char*>(
+                            memchr(line_start, '\n',
+                                   static_cast<size_t>(file_end - line_start)));
+                        if (!line_end) line_end = file_end;
+                        const size_t line_len =
+                            static_cast<size_t>(line_end - line_start);
+
+                        if (line_len <= kMaxIndexLineLen && line_len >= 3) {
+                            // Check if line has at least one alphanumeric char.
+                            bool has_alnum = false;
+                            for (size_t j = 0; j < line_len; ++j) {
+                                uint8_t c = static_cast<uint8_t>(line_start[j]);
+                                if ((c >= '0' && c <= '9') ||
+                                    (c >= 'A' && c <= 'Z') ||
+                                    (c >= 'a' && c <= 'z')) {
+                                    has_alnum = true;
+                                    break;
+                                }
+                            }
+                            if (has_alnum) {
+                                for (size_t i = 0; i + 2 < line_len; ++i) {
+                                    uint32_t t =
+                                        (static_cast<uint32_t>(static_cast<uint8_t>(line_start[i]))     << 16) |
+                                        (static_cast<uint32_t>(static_cast<uint8_t>(line_start[i + 1])) <<  8) |
+                                         static_cast<uint32_t>(static_cast<uint8_t>(line_start[i + 2]));
+                                    if (seen.insert(t).second)
+                                        buf.emplace_back(t, fid);
+                                }
+                            }
+                        }
+                        line_start = line_end + 1;
                     }
                 }
                 munmap(addr, fsize);
@@ -437,6 +572,17 @@ std::vector<fs::path> query_index(const fs::path& root,
 
     if (!fs::exists(lookup_path)) return {};
 
+    // Check index version.
+    {
+        std::ifstream vlf(lookup_path, std::ios::binary);
+        uint32_t version = 0;
+        vlf.read(reinterpret_cast<char*>(&version), sizeof(version));
+        if (version != kIndexVersion) {
+            std::cerr << "[cx] index format outdated, run --reindex\n";
+            return {};
+        }
+    }
+
     // Load file list
     std::vector<std::string> file_list;
     {
@@ -477,56 +623,147 @@ std::vector<fs::path> query_index(const fs::path& root,
     void* lookup_raw = mmap(nullptr, lookup_size, PROT_READ, MAP_PRIVATE, lfd, 0);
     close(lfd);
     if (lookup_raw == MAP_FAILED) return {};
-    const auto* lookup = static_cast<const LookupEntry*>(lookup_raw);
-
-    const size_t n_entries = lookup_size / sizeof(LookupEntry);
+    // Skip version header (uint32_t) at start of lookup file.
+    const auto* lookup = reinterpret_cast<const LookupEntry*>(
+        static_cast<const char*>(lookup_raw) + sizeof(uint32_t));
+    const size_t n_entries = (lookup_size - sizeof(uint32_t)) / sizeof(LookupEntry);
 
     std::ifstream postings_f(postings_path, std::ios::binary);
 
-    std::optional<std::vector<uint32_t>> candidates;
-
-    for (uint32_t trigram : pat_trigrams) {
-        // Binary search lookup
+    // Helper: binary-search the lookup table for a trigram, return its offset.
+    // Returns nullopt if not found.
+    auto find_trigram = [&](uint32_t trigram) -> std::optional<uint64_t> {
         size_t lo = 0, hi = n_entries;
-        bool found = false;
-        uint64_t poffset = 0;
         while (lo < hi) {
             size_t mid = lo + (hi - lo) / 2;
-            if (lookup[mid].trigram_hash == trigram) {
-                poffset = lookup[mid].offset;
-                found   = true;
-                break;
-            }
+            if (lookup[mid].trigram_hash == trigram) return lookup[mid].offset;
             if (lookup[mid].trigram_hash < trigram) lo = mid + 1;
             else                                    hi = mid;
         }
+        return std::nullopt;
+    };
 
-        if (!found) {
-            // No file contains this trigram -> intersection is empty
-            munmap(lookup_raw, lookup_size);
-            return {};
-        }
+    FastPForLib::CompositeCodec<FastPForLib::FastPFor<8>,
+                                FastPForLib::VariableByte> codec;
 
-        // Read posting list
+    // Helper: read a posting list at a given offset.
+    // Format: [uint32_t original_count, uint32_t compressed_size, data...]
+    // If compressed_size == 0, data is raw IDs. Otherwise, delta+FastPFor compressed.
+    auto read_posting = [&](uint64_t poffset) -> std::vector<uint32_t> {
         postings_f.seekg(static_cast<std::streamoff>(poffset));
-        uint32_t count = 0;
-        postings_f.read(reinterpret_cast<char*>(&count), sizeof(count));
-        std::vector<uint32_t> posting(count);
-        postings_f.read(reinterpret_cast<char*>(posting.data()),
-                        static_cast<std::streamsize>(count * sizeof(uint32_t)));
+        uint32_t original_count = 0;
+        uint32_t compressed_size = 0;
+        postings_f.read(reinterpret_cast<char*>(&original_count), sizeof(original_count));
+        postings_f.read(reinterpret_cast<char*>(&compressed_size), sizeof(compressed_size));
 
-        if (!candidates.has_value()) {
-            candidates = std::move(posting);
-        } else {
-            std::vector<uint32_t> intersected;
-            intersected.reserve(std::min(candidates->size(), posting.size()));
-            std::set_intersection(candidates->begin(), candidates->end(),
-                                  posting.begin(), posting.end(),
-                                  std::back_inserter(intersected));
-            candidates = std::move(intersected);
+        if (compressed_size == 0) {
+            // Uncompressed: read raw IDs.
+            std::vector<uint32_t> posting(original_count);
+            postings_f.read(reinterpret_cast<char*>(posting.data()),
+                            static_cast<std::streamsize>(original_count * sizeof(uint32_t)));
+            return posting;
         }
 
-        if (candidates->empty()) break;
+        // Compressed: read compressed data, decompress, then delta-decode.
+        std::vector<uint32_t> comp_buf(compressed_size);
+        postings_f.read(reinterpret_cast<char*>(comp_buf.data()),
+                        static_cast<std::streamsize>(compressed_size * sizeof(uint32_t)));
+
+        std::vector<uint32_t> posting(original_count);
+        size_t decoded_len = posting.size();
+        codec.decodeArray(comp_buf.data(), compressed_size,
+                          posting.data(), decoded_len);
+
+        // Delta decode: [3, 4, 3, 5] → [3, 7, 10, 15]
+        for (size_t i = 1; i < decoded_len; ++i)
+            posting[i] += posting[i - 1];
+
+        return posting;
+    };
+
+    std::optional<std::vector<uint32_t>> candidates;
+
+    // Fast path: pattern is exactly one trigram — single lookup, no intersection.
+    if (pat_trigrams.size() == 1) {
+        auto off = find_trigram(pat_trigrams[0]);
+        if (!off) { munmap(lookup_raw, lookup_size); return {}; }
+        candidates = read_posting(*off);
+    } else {
+        // For longer patterns, select at most 4 rarest trigrams to intersect.
+        // "Rarest" = smallest posting list. We probe each trigram's posting
+        // list size, then pick the smallest ones.
+        static constexpr size_t kMaxTrigrams = 4;
+
+        // Filter out noisy trigrams (all common punctuation/whitespace).
+        auto is_common_byte = [](uint8_t c) -> bool {
+            return c == ' ' || c == '(' || c == ')' || c == '{' || c == '}' ||
+                   c == '[' || c == ']' || c == ';' || c == '\t';
+        };
+        auto is_noisy_trigram = [&](uint32_t t) -> bool {
+            uint8_t a = static_cast<uint8_t>(t >> 16);
+            uint8_t b = static_cast<uint8_t>(t >> 8);
+            uint8_t c = static_cast<uint8_t>(t);
+            return is_common_byte(a) && is_common_byte(b) && is_common_byte(c);
+        };
+
+        // Gather (posting_count, trigram, offset) for each non-noisy trigram.
+        struct TrigramInfo {
+            uint32_t count;
+            uint32_t trigram;
+            uint64_t offset;
+        };
+        std::vector<TrigramInfo> infos;
+        infos.reserve(pat_trigrams.size());
+
+        for (uint32_t trigram : pat_trigrams) {
+            if (is_noisy_trigram(trigram) && pat_trigrams.size() > kMaxTrigrams)
+                continue;
+            auto off = find_trigram(trigram);
+            if (!off) { munmap(lookup_raw, lookup_size); return {}; }
+            // Peek at count without reading full posting list.
+            postings_f.seekg(static_cast<std::streamoff>(*off));
+            uint32_t count = 0;
+            postings_f.read(reinterpret_cast<char*>(&count), sizeof(count));
+            infos.push_back({count, trigram, *off});
+        }
+
+        if (infos.empty()) {
+            // All trigrams were noisy — fall back to using them all.
+            for (uint32_t trigram : pat_trigrams) {
+                auto off = find_trigram(trigram);
+                if (!off) { munmap(lookup_raw, lookup_size); return {}; }
+                postings_f.seekg(static_cast<std::streamoff>(*off));
+                uint32_t count = 0;
+                postings_f.read(reinterpret_cast<char*>(&count), sizeof(count));
+                infos.push_back({count, trigram, *off});
+            }
+        }
+
+        // Sort by posting list size (rarest first) and take at most kMaxTrigrams.
+        std::sort(infos.begin(), infos.end(),
+                  [](const TrigramInfo& a, const TrigramInfo& b) {
+                      return a.count < b.count;
+                  });
+        if (infos.size() > kMaxTrigrams)
+            infos.resize(kMaxTrigrams);
+
+        // Intersect the selected posting lists (rarest first for early pruning).
+        for (const auto& info : infos) {
+            auto posting = read_posting(info.offset);
+
+            if (!candidates.has_value()) {
+                candidates = std::move(posting);
+            } else {
+                std::vector<uint32_t> intersected;
+                intersected.reserve(std::min(candidates->size(), posting.size()));
+                std::set_intersection(candidates->begin(), candidates->end(),
+                                      posting.begin(), posting.end(),
+                                      std::back_inserter(intersected));
+                candidates = std::move(intersected);
+            }
+
+            if (candidates->empty()) break;
+        }
     }
 
     munmap(lookup_raw, lookup_size);

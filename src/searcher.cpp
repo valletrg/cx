@@ -51,20 +51,41 @@ static void scan_lines(const char* data, size_t file_size,
             line_view.remove_suffix(1);
 
         bool matched = false;
+        int  match_start = -1;
+        int  match_len   = 0;
+
         if (opts.use_regex) {
-            matched = re2::RE2::PartialMatch(line_view, *re);
+            re2::StringPiece input(line_view.data(), line_view.size());
+            re2::StringPiece submatch;
+            if (re->Match(input, 0, input.size(),
+                          re2::RE2::UNANCHORED, &submatch, 1)) {
+                matched     = true;
+                match_start = static_cast<int>(submatch.data() - line_view.data());
+                match_len   = static_cast<int>(submatch.size());
+            }
         } else if (opts.case_insensitive) {
             std::string lower_line(line_view);
             std::transform(lower_line.begin(), lower_line.end(),
                            lower_line.begin(), ::tolower);
-            matched = lower_line.find(lower_pattern) != std::string::npos;
+            auto pos = lower_line.find(lower_pattern);
+            if (pos != std::string::npos) {
+                matched     = true;
+                match_start = static_cast<int>(pos);
+                match_len   = static_cast<int>(lower_pattern.size());
+            }
         } else {
-            matched = simd_find(line_view.data(), line_view.size(),
-                                pattern.data(), pattern.size()) != nullptr;
+            const char* found = simd_find(line_view.data(), line_view.size(),
+                                          pattern.data(), pattern.size());
+            if (found) {
+                matched     = true;
+                match_start = static_cast<int>(found - line_view.data());
+                match_len   = static_cast<int>(pattern.size());
+            }
         }
 
         if (matched)
-            result.matches.push_back({line_num, std::string(line_view)});
+            result.matches.push_back(
+                {line_num, std::string(line_view), match_start, match_len});
 
         line_start = line_end + 1;
     }

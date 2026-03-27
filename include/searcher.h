@@ -8,6 +8,8 @@ namespace fs = std::filesystem;
 struct Match {
     int line;
     std::string content;
+    int match_start{-1};  // byte offset of match in content, -1 if unknown
+    int match_len{0};
 };
 
 struct FileResult {
