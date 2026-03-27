@@ -9,7 +9,7 @@ license=('MIT')
 depends=('gcc-libs')
 makedepends=('cmake' 'ninja' 'git')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('5917aa7459aa812745382e2ce869cd98daf089a66af7692978eed3fbc75554e2')
+sha256sums=('1d40347e1f04d64970e6160b1c2ce0eae7844bc175ed655dcf2c1847811a69e2')
 
 build() {
     cd "$srcdir/cx-$pkgver"
