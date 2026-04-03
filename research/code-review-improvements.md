@@ -1,8 +1,40 @@
-# cx — Code Review & Improvement Research
+# cx — Code Review & Improvements Research
 
 **Review Date:** April 2, 2026
+**Last Updated:** April 2, 2026 (post implementation)
 **Project:** ~/projects/cx
 **Language:** C++23
+
+---
+
+## Implementation Summary ✅
+
+The following quick wins from this document have been **implemented** (commit `73b0700`):
+
+| # | Quick Win | Status | Notes |
+|---|-----------|--------|-------|
+| 1 | Pre-compile regex once | ✅ Done | Moved from per-file `SearchOptions` to `main()`, pass via `.re` pointer |
+| 2 | TLS scratch buffer for case-insensitive search | ✅ Done | Replaced per-line `std::string` allocation with `thread_local` buffer |
+| 3 | Skip content capture in files-only mode | ✅ Done | Added `.files_only` to `SearchOptions`, avoids `std::string(line_view)` |
+| 4 | Centralize gitignore parsing | ✅ Done | Moved `parse_gitignore()` from `main.cpp` → `load_gitignore()` in `walker.cpp/h` |
+| 5 | TLS invariant assert | ✅ Done | Added `assert(tl_result.matches.empty())` before `search_file()` |
+
+**Files modified:** `include/searcher.h`, `include/walker.h`, `src/main.cpp`, `src/searcher.cpp`, `src/walker.cpp`
+
+## Remaining Quick Wins (not implemented)
+
+| # | Improvement | Effort | Reason deferred |
+|---|-------------|--------|----------------|
+| 6 | UTF-8 JSON escaping fix | Low | Needs downstream validation (Claude handles raw UTF-8 but worth testing) |
+| 7 | RE2 version bump | Medium | Risky — may need Abseil dependency update, test suite changes |
+| 8 | Dead code cleanup | Low | Cosmetic, won't merge cleanly without coordination |
+
+## P1/P2 items (not done)
+- SIMD character classification for trigram extraction
+- Replace `unordered_set` with sorted vectors for trigram dedup
+- More sophisticated SIMD find for longer patterns
+
+---
 
 ## Project Overview
 
