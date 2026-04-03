@@ -55,11 +55,12 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
-#include <fstream>
-#include <iostream>
 #include <format>
+#include <iostream>
 #include <mutex>
 #include <thread>
+#include <cassert>
+#include <memory>
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -74,26 +75,6 @@
 #include "threadpool.h"
 
 namespace fs = std::filesystem;
-
-// ---------------------------------------------------------------------------
-// Gitignore parsing
-// ---------------------------------------------------------------------------
-
-static std::vector<std::string> parse_gitignore(const fs::path& root) {
-    std::vector<std::string> patterns;
-    std::ifstream f(root / ".gitignore");
-    if (!f) return patterns;
-    std::string line;
-    while (std::getline(f, line)) {
-        // Trim trailing whitespace
-        while (!line.empty() && (line.back() == ' ' || line.back() == '\t' ||
-                                  line.back() == '\r'))
-            line.pop_back();
-        if (line.empty() || line.front() == '#') continue;
-        patterns.push_back(std::move(line));
-    }
-    return patterns;
-}
 
 // ---------------------------------------------------------------------------
 // JSON helpers
@@ -304,7 +285,7 @@ int main(int argc, char* argv[]) {
     const fs::path root(search_path);
 
     // Parse .gitignore from the search root (if present)
-    const auto gitignore = parse_gitignore(root);
+    const auto gitignore = load_gitignore(root);
 
     // --- Phase 3: index management ---
     if (reindex) {
@@ -343,9 +324,21 @@ int main(int argc, char* argv[]) {
         files = collect_files(root, walk_opts);
     }
 
+    // --- Pre-compile regex (if needed) so we compile once, not per-file ---
+    std::unique_ptr<re2::RE2> re_compiled;
+    if (use_regex) {
+        re2::RE2::Options re_opts;
+        re_opts.set_case_sensitive(!case_insensitive);
+        re_opts.set_log_errors(false);
+        re_compiled = std::make_unique<re2::RE2>(pattern, re_opts);
+        // Already validated above — re_compiled is guaranteed ok() here.
+    }
+
     // --- Search files in parallel ---
     SearchOptions sopts{.use_regex = use_regex,
-                        .case_insensitive = case_insensitive};
+                        .case_insensitive = case_insensitive,
+                        .files_only = files_only,
+                        .re = re_compiled.get()};
     std::vector<FileResult> results;
     results.reserve(files.size());
     std::mutex results_mtx;
@@ -366,6 +359,7 @@ int main(int argc, char* argv[]) {
                             }
 
                             thread_local FileResult tl_result;
+                            assert(tl_result.matches.empty());
                             search_file(f, pattern, sopts, tl_result);
                             if (!tl_result.matches.empty()) {
                                 // Move file+density fields; steal matches

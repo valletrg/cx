@@ -21,7 +21,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
-#include <memory>
 #include <string_view>
 
 #include <re2/re2.h>
@@ -32,7 +31,6 @@ static constexpr size_t BINARY_PROBE_SIZE = 8192;
 static void scan_lines(const char* data, size_t file_size,
                        const std::string& pattern,
                        const SearchOptions& opts,
-                       const re2::RE2* re,
                        const std::string& lower_pattern,
                        FileResult& result) {
     const char* end        = data + file_size;
@@ -57,17 +55,19 @@ static void scan_lines(const char* data, size_t file_size,
         if (opts.use_regex) {
             re2::StringPiece input(line_view.data(), line_view.size());
             re2::StringPiece submatch;
-            if (re->Match(input, 0, input.size(),
-                          re2::RE2::UNANCHORED, &submatch, 1)) {
+            if (opts.re->Match(input, 0, input.size(),
+                               re2::RE2::UNANCHORED, &submatch, 1)) {
                 matched     = true;
                 match_start = static_cast<int>(submatch.data() - line_view.data());
                 match_len   = static_cast<int>(submatch.size());
             }
         } else if (opts.case_insensitive) {
-            std::string lower_line(line_view);
-            std::transform(lower_line.begin(), lower_line.end(),
-                           lower_line.begin(), ::tolower);
-            auto pos = lower_line.find(lower_pattern);
+            // Thread-local buffer avoids per-line allocation.
+            thread_local std::string lower_buf;
+            lower_buf.resize(line_view.size());
+            std::transform(line_view.begin(), line_view.end(),
+                           lower_buf.begin(), ::tolower);
+            auto pos = lower_buf.find(lower_pattern);
             if (pos != std::string::npos) {
                 matched     = true;
                 match_start = static_cast<int>(pos);
@@ -83,9 +83,16 @@ static void scan_lines(const char* data, size_t file_size,
             }
         }
 
-        if (matched)
-            result.matches.push_back(
-                {line_num, std::string(line_view), match_start, match_len});
+        if (matched) {
+            // When files_only is set, we only need match counts.
+            // Skip allocating line content entirely.
+            if (opts.files_only) {
+                result.matches.push_back({line_num, "", 0, 0});
+            } else {
+                result.matches.push_back(
+                    {line_num, std::string(line_view), match_start, match_len});
+            }
+        }
 
         line_start = line_end + 1;
     }
@@ -117,16 +124,10 @@ bool search_file(const fs::path& path,
 
     const size_t file_size = static_cast<size_t>(st.st_size);
 
-    std::unique_ptr<re2::RE2> re;
-    if (opts.use_regex) {
-        re2::RE2::Options re_opts;
-        re_opts.set_case_sensitive(!opts.case_insensitive);
-        re_opts.set_log_errors(false);
-        re = std::make_unique<re2::RE2>(pattern, re_opts);
-        if (!re->ok()) {
-            close(fd);
-            return false;
-        }
+    // Regex should be pre-compiled by the caller and passed via opts.re.
+    if (opts.use_regex && !opts.re) {
+        close(fd);
+        return false;
     }
 
     std::string lower_pattern;
@@ -146,8 +147,7 @@ bool search_file(const fs::path& path,
         const size_t check_size = std::min(actual, BINARY_PROBE_SIZE);
         if (memchr(buf.data(), '\0', check_size) != nullptr) return false;
 
-        scan_lines(buf.data(), actual, pattern, opts, re.get(),
-                   lower_pattern, result);
+        scan_lines(buf.data(), actual, pattern, opts, lower_pattern, result);
     } else {
         void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
@@ -160,8 +160,7 @@ bool search_file(const fs::path& path,
             return false;
         }
 
-        scan_lines(data, file_size, pattern, opts, re.get(),
-                   lower_pattern, result);
+        scan_lines(data, file_size, pattern, opts, lower_pattern, result);
         munmap(mapped, file_size);
     }
 

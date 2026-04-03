@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+namespace re2 { class RE2; }
 namespace fs = std::filesystem;
 
 struct Match {
@@ -22,6 +23,8 @@ struct FileResult {
 struct SearchOptions {
     bool use_regex{false};
     bool case_insensitive{false};
+    bool files_only{false};
+    const re2::RE2* re{nullptr};  // pre-compiled regex, set by caller
 };
 
 // Search a single file. Clears and fills `result` in place so the caller can

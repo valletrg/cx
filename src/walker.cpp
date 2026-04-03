@@ -1,8 +1,26 @@
 #include "walker.h"
 
 #include <fnmatch.h>
+#include <fstream>
 #include <string_view>
 #include <unordered_set>
+
+// Parse a .gitignore file at `root/.gitignore` and return its raw patterns.
+// Strips trailing whitespace, skips empty lines and comments.
+std::vector<std::string> load_gitignore(const fs::path& root) {
+    std::vector<std::string> patterns;
+    std::ifstream f(root / ".gitignore");
+    if (!f) return patterns;
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t' ||
+                                  line.back() == '\r'))
+            line.pop_back();
+        if (line.empty() || line.front() == '#') continue;
+        patterns.push_back(std::move(line));
+    }
+    return patterns;
+}
 
 // Pre-classified gitignore patterns for fast matching.
 struct GitignoreRules {
