@@ -1,15 +1,3 @@
-// Benchmark results (LLVM ~180k files, "std::vector" -t .cpp vs rg -t cpp):
-//   baseline (mmap-only, string_view::find):   cx 379ms  rg 445ms  (+15%)
-//   opt1+2+3+5 (all active, simple queue):     cx 410ms  rg 469ms  (+15%)
-//   opt4 (work-stealing pool): REVERTED — added overhead without benefit
-//     on I/O-bound workloads with pre-distributed round-robin queues.
-//
-// Active optimizations:
-//   opt1: read() for files < 64KB, mmap for larger files
-//   opt2: thread_local FileResult reuses Match vector allocation across files
-//   opt3: inlined AVX2/SSE2 first+last byte filter before memcmp
-//   opt5: posix_fadvise(WILLNEED) on next file while scanning current
-
 #include "searcher.h"
 #include "simd_search.h"
 

@@ -4,7 +4,7 @@ PLANS.md
 CLAUDE.md
 *_PROMPT.md
 .cache/
-
+research/
 *.o
 *.a
 *.so
@@ -15,3 +15,7 @@ CLAUDE.md
 packaging/pkg/
 packaging/*.pkg.tar.zst
 packaging/*.pkg.tar.xz
+
+.hydragent
+
+

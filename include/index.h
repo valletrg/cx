@@ -7,7 +7,7 @@
 
 namespace fs = std::filesystem;
 
-// Build (or rebuild) the trigram index under <root>/.codeseek/.
+// Build (or rebuild) the trigram index under <root>/.cx/.
 // Returns true on success.
 bool build_index(const fs::path& root, const WalkOptions& opts);
 

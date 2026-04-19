@@ -27,13 +27,7 @@
 #include <variablebyte.h>
 #pragma GCC diagnostic pop
 
-// ---------------------------------------------------------------------------
-// On-disk layout inside <root>/.cx/
-//
-//   files    — newline-separated file paths; line N (0-based) == file ID N
-//   postings — concatenated posting lists: [uint32_t count, uint32_t id, ...]
-//   lookup   — sorted array of LookupEntry (trigram_hash → offset in postings)
-// ---------------------------------------------------------------------------
+// On-disk layout: files, postings, lookup
 
 static constexpr const char* kIndexDir        = ".cx";
 static constexpr size_t      kBinaryProbeSize = 8192;
@@ -62,9 +56,71 @@ struct LookupEntry {
 };
 #pragma pack(pop)
 
-// ---------------------------------------------------------------------------
+// Shared helpers
+
+// Returns true if byte is alphanumeric [0-9A-Za-z].
+[[gnu::always_inline]] inline bool is_alnum_byte(uint8_t c) {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+// Encode three consecutive bytes as a 24-bit trigram hash.
+// Input bytes must be valid (caller ensures this).
+[[gnu::always_inline]] inline uint32_t trigram_hash_3(uint8_t a, uint8_t b, uint8_t c) {
+    return (static_cast<uint32_t>(a) << 16) |
+           (static_cast<uint32_t>(b) <<  8) |
+            static_cast<uint32_t>(c);
+}
+
+// Write a posting list to `pf` (postings file) and emit a LookupEntry to `lf`.
+// Handles both compressed and uncompressed formats.
+// Caller provides `codec`, `deltas`, and `compressed` buffers for reuse.
+static void write_one_posting(std::ofstream& pf, std::ofstream& lf,
+                              uint32_t trigram_hash, uint64_t& offset,
+                              const std::vector<uint32_t>& ids,
+                              FastPForLib::CompositeCodec<FastPForLib::FastPFor<8>,
+                                                          FastPForLib::VariableByte>& codec,
+                              std::vector<uint32_t>& deltas,
+                              std::vector<uint32_t>& compressed,
+                              size_t& total_original_size,
+                              size_t& total_compressed_size) {
+    LookupEntry entry{trigram_hash, offset};
+    lf.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
+
+    auto original_count = static_cast<uint32_t>(ids.size());
+    auto original_size = ids.size() * sizeof(uint32_t);
+    total_original_size += original_size;
+
+    if (original_count < kMinCompressSize) {
+        uint32_t compressed_size = 0;
+        pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
+        pf.write(reinterpret_cast<const char*>(&compressed_size), sizeof(compressed_size));
+        pf.write(reinterpret_cast<const char*>(ids.data()),
+                 static_cast<std::streamsize>(ids.size() * sizeof(uint32_t)));
+        offset += 2 * sizeof(uint32_t) + ids.size() * sizeof(uint32_t);
+    } else {
+        deltas.resize(ids.size());
+        deltas[0] = ids[0];
+        for (size_t i = 1; i < ids.size(); ++i)
+            deltas[i] = ids[i] - ids[i - 1];
+
+        compressed.resize(ids.size() + 1024);
+        size_t compressed_len = compressed.size();
+        codec.encodeArray(deltas.data(), deltas.size(),
+                          compressed.data(), compressed_len);
+
+        auto comp_size = static_cast<uint32_t>(compressed_len);
+        auto comp_size_bytes = compressed_len * sizeof(uint32_t);
+        total_compressed_size += comp_size_bytes;
+
+        pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
+        pf.write(reinterpret_cast<const char*>(&comp_size), sizeof(comp_size));
+        pf.write(reinterpret_cast<const char*>(compressed.data()),
+                 static_cast<std::streamsize>(compressed_len * sizeof(uint32_t)));
+        offset += 2 * sizeof(uint32_t) + compressed_len * sizeof(uint32_t);
+    }
+}
+
 // In-memory index (kept alive for the inotify watcher)
-// ---------------------------------------------------------------------------
 
 struct InMemoryIndex {
     std::vector<std::string>                          files;
@@ -75,9 +131,7 @@ struct InMemoryIndex {
 // Single global instance; populated by build_index, updated by the watcher.
 static InMemoryIndex g_index; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 static std::unordered_set<uint32_t> extract_trigrams(std::string_view content) {
     std::unordered_set<uint32_t> out;
@@ -95,19 +149,14 @@ static std::unordered_set<uint32_t> extract_trigrams(std::string_view content) {
         if (line_len <= kMaxIndexLineLen && line_len >= 3) {
             bool has_alnum = false;
             for (size_t j = 0; j < line_len; ++j) {
-                uint8_t c = static_cast<uint8_t>(line_start[j]);
-                if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-                    (c >= 'a' && c <= 'z')) {
+                if (is_alnum_byte(line_start[j])) {
                     has_alnum = true;
                     break;
                 }
             }
             if (has_alnum) {
                 for (size_t i = 0; i + 2 < line_len; ++i) {
-                    uint32_t t =
-                        (static_cast<uint32_t>(static_cast<uint8_t>(line_start[i]))     << 16) |
-                        (static_cast<uint32_t>(static_cast<uint8_t>(line_start[i + 1])) <<  8) |
-                         static_cast<uint32_t>(static_cast<uint8_t>(line_start[i + 2]));
+                    uint32_t t = trigram_hash_3(line_start[i], line_start[i + 1], line_start[i + 2]);
                     out.insert(t);
                 }
             }
@@ -167,37 +216,19 @@ static void write_index(const fs::path& index_dir) {
     std::vector<uint32_t> compressed;
 
     uint64_t offset = 0;
+    size_t total_original_size = 0;
+    size_t total_compressed_size = 0;
+
     for (const auto& [hash, ids] : sorted) {
-        LookupEntry entry{hash, offset};
-        lf.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
+        write_one_posting(pf, lf, hash, offset, ids,
+                         codec, deltas, compressed,
+                         total_original_size, total_compressed_size);
+    }
 
-        auto original_count = static_cast<uint32_t>(ids.size());
-
-        if (original_count < kMinCompressSize) {
-            uint32_t compressed_size = 0;
-            pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
-            pf.write(reinterpret_cast<const char*>(&compressed_size), sizeof(compressed_size));
-            pf.write(reinterpret_cast<const char*>(ids.data()),
-                     static_cast<std::streamsize>(ids.size() * sizeof(uint32_t)));
-            offset += 2 * sizeof(uint32_t) + ids.size() * sizeof(uint32_t);
-        } else {
-            deltas.resize(ids.size());
-            deltas[0] = ids[0];
-            for (size_t i = 1; i < ids.size(); ++i)
-                deltas[i] = ids[i] - ids[i - 1];
-
-            compressed.resize(ids.size() + 1024);
-            size_t compressed_len = compressed.size();
-            codec.encodeArray(deltas.data(), deltas.size(),
-                              compressed.data(), compressed_len);
-
-            auto comp_size = static_cast<uint32_t>(compressed_len);
-            pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
-            pf.write(reinterpret_cast<const char*>(&comp_size), sizeof(comp_size));
-            pf.write(reinterpret_cast<const char*>(compressed.data()),
-                     static_cast<std::streamsize>(compressed_len * sizeof(uint32_t)));
-            offset += 2 * sizeof(uint32_t) + compressed_len * sizeof(uint32_t);
-        }
+    if (total_original_size > 0) {
+        double ratio = static_cast<double>(total_compressed_size) / total_original_size;
+        std::cerr << "[cx] index compression: " << ratio
+                  << " (" << total_compressed_size << " / " << total_original_size << " bytes)\n";
     }
 }
 
@@ -282,7 +313,6 @@ struct RunReader {
     void close_file() {
         if (fd >= 0) { close(fd); fd = -1; }
         buf.clear();
-        buf.shrink_to_fit();
     }
 };
 
@@ -325,41 +355,14 @@ static void merge_runs(const std::vector<fs::path>& run_paths,
     std::vector<uint32_t> deltas;    // reusable delta buffer
     std::vector<uint32_t> compressed; // reusable compression buffer
 
+    size_t total_original_size = 0;
+    size_t total_compressed_size = 0;
+
     auto flush_posting = [&]() {
         if (cur_ids.empty()) return;
-        LookupEntry entry{cur_trigram, offset};
-        lf.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
-
-        auto original_count = static_cast<uint32_t>(cur_ids.size());
-
-        if (original_count < kMinCompressSize) {
-            // Store uncompressed: [original_count, 0 (compressed_size=0), raw ids...]
-            uint32_t compressed_size = 0;
-            pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
-            pf.write(reinterpret_cast<const char*>(&compressed_size), sizeof(compressed_size));
-            pf.write(reinterpret_cast<const char*>(cur_ids.data()),
-                     static_cast<std::streamsize>(cur_ids.size() * sizeof(uint32_t)));
-            offset += 2 * sizeof(uint32_t) + cur_ids.size() * sizeof(uint32_t);
-        } else {
-            // Delta encode
-            deltas.resize(cur_ids.size());
-            deltas[0] = cur_ids[0];
-            for (size_t i = 1; i < cur_ids.size(); ++i)
-                deltas[i] = cur_ids[i] - cur_ids[i - 1];
-
-            // Compress
-            compressed.resize(cur_ids.size() + 1024); // generous output buffer
-            size_t compressed_len = compressed.size();
-            codec.encodeArray(deltas.data(), deltas.size(),
-                              compressed.data(), compressed_len);
-
-            auto compressed_size = static_cast<uint32_t>(compressed_len);
-            pf.write(reinterpret_cast<const char*>(&original_count), sizeof(original_count));
-            pf.write(reinterpret_cast<const char*>(&compressed_size), sizeof(compressed_size));
-            pf.write(reinterpret_cast<const char*>(compressed.data()),
-                     static_cast<std::streamsize>(compressed_len * sizeof(uint32_t)));
-            offset += 2 * sizeof(uint32_t) + compressed_len * sizeof(uint32_t);
-        }
+        write_one_posting(pf, lf, cur_trigram, offset, cur_ids,
+                          codec, deltas, compressed,
+                          total_original_size, total_compressed_size);
         cur_ids.clear();
     };
 
@@ -386,11 +389,15 @@ static void merge_runs(const std::vector<fs::path>& run_paths,
     flush_posting();
 
     for (auto& r : readers) r.close_file();
+
+    if (total_original_size > 0) {
+        double ratio = static_cast<double>(total_compressed_size) / total_original_size;
+        std::cerr << "[cx] index compression: " << ratio
+                  << " (" << total_compressed_size << " / " << total_original_size << " bytes)\n";
+    }
 }
 
-// ---------------------------------------------------------------------------
 // Public API
-// ---------------------------------------------------------------------------
 
 bool build_index(const fs::path& root, const WalkOptions& opts) {
     const fs::path index_dir = root / kIndexDir;
@@ -434,9 +441,7 @@ bool build_index(const fs::path& root, const WalkOptions& opts) {
     std::vector<fs::path> run_paths;
     std::mutex             run_paths_mtx;
 
-    // Per-thread buffers indexed by slot ID. Each pool thread claims a slot
-    // on its first task via thread_local + atomic counter. After pool.wait()
-    // returns (all threads joined or idle), we iterate these to flush leftovers.
+    // Per-thread buffers. Each pool thread claims a slot on its first task.
     std::atomic<uint32_t> slot_counter{0};
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> thread_bufs(n_threads);
 
@@ -491,20 +496,14 @@ bool build_index(const fs::path& root, const WalkOptions& opts) {
                             // Check if line has at least one alphanumeric char.
                             bool has_alnum = false;
                             for (size_t j = 0; j < line_len; ++j) {
-                                uint8_t c = static_cast<uint8_t>(line_start[j]);
-                                if ((c >= '0' && c <= '9') ||
-                                    (c >= 'A' && c <= 'Z') ||
-                                    (c >= 'a' && c <= 'z')) {
+                                if (is_alnum_byte(line_start[j])) {
                                     has_alnum = true;
                                     break;
                                 }
                             }
                             if (has_alnum) {
                                 for (size_t i = 0; i + 2 < line_len; ++i) {
-                                    uint32_t t =
-                                        (static_cast<uint32_t>(static_cast<uint8_t>(line_start[i]))     << 16) |
-                                        (static_cast<uint32_t>(static_cast<uint8_t>(line_start[i + 1])) <<  8) |
-                                         static_cast<uint32_t>(static_cast<uint8_t>(line_start[i + 2]));
+                                    uint32_t t = trigram_hash_3(line_start[i], line_start[i + 1], line_start[i + 2]);
                                     if (seen.insert(t).second)
                                         buf.emplace_back(t, fid);
                                 }
@@ -541,12 +540,10 @@ bool build_index(const fs::path& root, const WalkOptions& opts) {
 
     // Release memory from file list and path map before merge phase.
     files.clear();
-    files.shrink_to_fit();
     path_to_id.clear();
     // Force deallocation (unordered_map doesn't release on clear alone).
     { std::unordered_map<std::string, uint32_t> tmp; path_to_id.swap(tmp); }
     thread_bufs.clear();
-    thread_bufs.shrink_to_fit();
 
     // Phase 2: K-way merge all run files into final postings + lookup.
     merge_runs(run_paths, index_dir);
@@ -605,9 +602,7 @@ std::vector<fs::path> query_index(const fs::path& root,
     // Collect unique trigrams from the (literal) pattern
     std::vector<uint32_t> pat_trigrams;
     for (size_t i = 0; i + 2 < pattern.size(); ++i) {
-        uint32_t t = (static_cast<uint32_t>(static_cast<uint8_t>(pattern[i]))     << 16) |
-                     (static_cast<uint32_t>(static_cast<uint8_t>(pattern[i + 1])) <<  8) |
-                      static_cast<uint32_t>(static_cast<uint8_t>(pattern[i + 2]));
+        uint32_t t = trigram_hash_3(pattern[i], pattern[i + 1], pattern[i + 2]);
         pat_trigrams.push_back(t);
     }
     std::sort(pat_trigrams.begin(), pat_trigrams.end());
